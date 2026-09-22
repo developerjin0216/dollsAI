@@ -1,30 +1,58 @@
 {
   "expo": {
-    "name": "ClawMaster",
-    "slug": "ClawMaster",
-    "version": "1.0.0",
+    "name": "뽑기 AI",
+    "slug": "dollsAI",
+    "version": "1.3.4",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#1a1a2e"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.dollsai.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "인형뽑기 기계를 분석하기 위해 카메라 접근이 필요합니다."
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#1a1a2e"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "package": "com.dollsai.app",
+      "versionCode": 13,
+      "permissions": ["CAMERA"],
+      "blockedPermissions": ["android.permission.RECORD_AUDIO"]
     },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "인형뽑기 기계를 분석하기 위해 카메라 접근이 필요합니다."
+        }
+      ],
+      [
+        "react-native-google-mobile-ads",
+        {
+          "androidAppId": "ca-app-pub-3640943750342373~9300730008",
+          "iosAppId": "ca-app-pub-3640943750342373~9300730008"
+        }
+      ]
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "c2d7c883-ba14-4f93-81b6-c0fd8a9b835c"
+      }
+    },
+    "owner": "jinwoo777"
   }
 }

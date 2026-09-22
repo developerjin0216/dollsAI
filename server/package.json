@@ -1,0 +1,17 @@
+{
+  "name": "dollsai-analyze-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker proxy that keeps the vision-API keys off the mobile app",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.9.2",
+    "wrangler": "^3.99.0"
+  }
+}

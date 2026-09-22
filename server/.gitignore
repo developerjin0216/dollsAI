@@ -1,0 +1,4 @@
+node_modules/
+.wrangler/
+# wrangler 로컬 개발용 비밀값 — 절대 커밋하지 말 것
+.dev.vars

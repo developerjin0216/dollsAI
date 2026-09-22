@@ -2,5 +2,7 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true
-  }
+  },
+  // server/ 는 Cloudflare Workers 런타임용이라 자체 tsconfig로 따로 검사한다.
+  "exclude": ["node_modules", "server", "scripts"]
 }

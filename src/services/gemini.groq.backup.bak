@@ -1,0 +1,203 @@
+import { GROQ_API_KEY } from '../constants/Config';
+
+export interface ClawInfo {
+  size: string;
+  position: string;
+  positionX: number;
+  positionY: number;
+  strength: string;
+  openWidth: string;
+}
+
+export interface Target {
+  name: string;
+  type: 'plush' | 'box' | 'figure' | 'other';
+  position: string;
+  positionX: number;
+  positionY: number;
+  size: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  reason: string;
+  grabPoint: string;
+  grabDetail: string;
+}
+
+export interface AnalysisResult {
+  claw: ClawInfo;
+  targets: Target[];
+  bestTarget: Target;
+  strategy: string;
+  confidence: number;
+  tips: string[];
+}
+
+const API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+const SYSTEM_PROMPT = `You are a professional claw machine (crane game / UFO catcher) strategist. You help users win prizes by analyzing machine photos with extreme precision.
+
+## STEP 1: Analyze the Claw (MANDATORY)
+Before analyzing prizes, you MUST first analyze the claw/crane:
+- **Size**: Estimate the claw's open width (small/medium/large) relative to the prizes.
+- **Position**: Where is the claw currently located in the image?
+- **Grip strength estimate**: Based on claw type — 2-prong claws are weaker, 3-prong are stronger. Thin wire claws are weak, thick rubber-tipped claws grip well.
+- **Open width**: Estimate how wide the claw opens compared to the prizes. If the claw is smaller than the prize, a full grab is impossible — suggest alternative strategies.
+
+## STEP 2: Identify Each Prize Accurately
+- ONLY describe what you clearly see. Never guess.
+- The claw/crane arm is a MACHINE PART — never list it as a prize.
+- Identify by VISIBLE features: color, ear shape, face shape, body proportions.
+  - Pointy ears + long snout = dog/fox, NOT bear.
+  - Round ears on top + round face = bear.
+  - Triangular ears + whiskers = cat.
+  - Known characters (Pikachu, Stitch, Rilakkuma, Sanrio, etc.) → name specifically.
+- Classify type: "plush" (stuffed animal), "box" (boxed product), "figure" (plastic figure), "other".
+
+## STEP 3: Strategy by Prize Type
+
+### For BOXES:
+- **Gap insertion (틈새 끼우기)**: Look for gaps between boxes where the claw can wedge in. This is the #1 strategy for boxes.
+- **Edge hooking**: If a box edge is protruding or elevated, the claw can hook under it.
+- **Sliding**: If a box is near the drop chute, the claw can push/slide it toward the exit even without a full grip.
+- Describe the exact gap or edge where the claw should target.
+
+### For PLUSHES:
+- **Center of gravity**: Identify the heaviest part (usually the head/body). Grabbing above the center of gravity prevents the plush from slipping.
+- **Lock points (잠금 포인트)**: Spots where the claw won't slip off — between head and body (neck), under arms/limbs, between legs. These are critical.
+- **Tag/loop grab**: If a tag or loop is visible, that's a high-success grab point.
+- **Avoid smooth/round surfaces**: The claw slides off round heads and smooth bodies easily.
+
+### For ALL prizes:
+- **Stacking near exit (탑 쌓기)**: If prizes are stacked near the drop chute, even a weak grab that nudges the top item can make it fall into the chute. This is a high-value opportunity — always flag it.
+- **Drop chute proximity**: Items closest to the drop chute always have highest priority, even if they're harder to grab. A partial grab + gravity can succeed.
+
+## STEP 4: grabPoint vs grabDetail
+- **grabPoint**: Short summary of WHERE to grab (e.g. "목 부분", "상자 왼쪽 틈새")
+- **grabDetail**: Detailed explanation of HOW to execute — step by step claw positioning, approach angle, what to avoid, what can go wrong, and backup plan.
+
+## Position Coordinates
+positionX, positionY = center of each item as percentage (0–100).
+Top-left = (0,0), bottom-right = (100,100).
+
+## Confidence Scoring
+- 0.0–0.3: Everything packed tight, very low chance.
+- 0.3–0.5: Possible but risky, may need multiple attempts.
+- 0.5–0.7: Clear target exists, decent chance with good aim.
+- 0.7–1.0: Isolated prize with excellent grab point and clear exit path.
+
+Always respond in Korean. Return ONLY valid JSON.`;
+
+const ANALYSIS_PROMPT = `이 인형뽑기 기계 사진을 분석해주세요.
+
+1단계: 집게(크레인) 크기, 위치, 예상 파지력을 먼저 분석
+2단계: 모든 상품을 정확히 식별 (인형/상자/피규어 구분)
+3단계: 각 상품별 최적 공략법 제시
+4단계: 종합 전략과 팁
+
+JSON 형식:
+{"claw":{"size":"소/중/대","position":"집게 위치","positionX":0,"positionY":0,"strength":"약/중/강 + 근거","openWidth":"상품 대비 집게 벌림 폭"},"targets":[{"name":"구체적 설명","type":"plush|box|figure|other","position":"위치","positionX":0,"positionY":0,"size":"소/중/대","difficulty":"easy|medium|hard","reason":"난이도 근거","grabPoint":"잡을 포인트 요약","grabDetail":"상세 공략법: 집게 위치 조정, 접근 각도, 주의사항, 실패 시 대안"}],"bestTarget":{같은 형식},"strategy":"종합 단계별 공략법","confidence":0.0,"tips":["실전 팁"]}`;
+
+const REQUEST_TIMEOUT = 30000;
+
+export async function analyzeClawMachine(base64Image: string): Promise<AnalysisResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+  const body = {
+    model: MODEL,
+    messages: [
+      {
+        role: 'system' as const,
+        content: SYSTEM_PROMPT,
+      },
+      {
+        role: 'user' as const,
+        content: [
+          { type: 'text' as const, text: ANALYSIS_PROMPT },
+          {
+            type: 'image_url' as const,
+            image_url: {
+              url: `data:image/jpeg;base64,${base64Image}`,
+            },
+          },
+        ],
+      },
+    ],
+    temperature: 0.3,
+    max_tokens: 2500,
+    response_format: { type: 'json_object' as const },
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error: any) {
+    if (error.name === 'AbortError') {
+      throw new Error('분석 시간이 초과되었습니다.\n잠시 후 다시 시도해주세요.');
+    }
+    throw new Error('네트워크 연결을 확인해주세요.\n다시 시도해주세요.');
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    // API 원본 에러 대신 상태 코드별 사용자 친화적 메시지
+    const status = response.status;
+    if (status === 401 || status === 403) {
+      throw new Error('인증 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.');
+    } else if (status === 429) {
+      throw new Error('요청이 너무 많습니다.\n잠시 후 다시 시도해주세요.');
+    } else if (status >= 500) {
+      throw new Error('AI 서버에 일시적인 문제가 있습니다.\n잠시 후 다시 시도해주세요.');
+    }
+    throw new Error('분석 중 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.');
+  }
+
+  const data = await response.json();
+  const responseText = data?.choices?.[0]?.message?.content;
+
+  if (!responseText) {
+    throw new Error('AI 응답을 받지 못했습니다.\n잠시 후 다시 시도해주세요.');
+  }
+
+  const cleanJson = responseText
+    .replace(/```json\n?/g, '')
+    .replace(/```\n?/g, '')
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleanJson);
+    if (!parsed.bestTarget || !parsed.strategy || !Array.isArray(parsed.targets)) {
+      throw new Error();
+    }
+    if (!parsed.claw) {
+      parsed.claw = { size: '알 수 없음', position: '', positionX: 50, positionY: 20, strength: '알 수 없음', openWidth: '알 수 없음' };
+    }
+    if (!Array.isArray(parsed.tips)) {
+      parsed.tips = [];
+    }
+    parsed.confidence = Math.min(Math.max(parsed.confidence ?? 0, 0), 1);
+
+    const clampCoord = (t: any) => {
+      t.positionX = Math.min(Math.max(t.positionX ?? 50, 0), 100);
+      t.positionY = Math.min(Math.max(t.positionY ?? 50, 0), 100);
+    };
+    clampCoord(parsed.bestTarget);
+    parsed.targets?.forEach(clampCoord);
+    if (parsed.claw) {
+      clampCoord(parsed.claw);
+    }
+
+    return parsed as AnalysisResult;
+  } catch {
+    throw new Error('분석 결과를 처리할 수 없습니다.\n다시 촬영해주세요.');
+  }
+}

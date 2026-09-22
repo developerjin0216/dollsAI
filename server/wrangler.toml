@@ -1,0 +1,37 @@
+name = "dollsai-analyze"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# 로그 확인용 (wrangler tail)
+[observability]
+enabled = true
+
+# ⚠️ 필수 설정 — 제거하지 말 것.
+# Gemini API는 홍콩(HKG) 등 일부 지역을 지원하지 않아
+# "User location is not supported for the API use." (400 FAILED_PRECONDITION) 를 반환한다.
+# Cloudflare는 기본적으로 "사용자와 가까운" 콜로에서 실행하므로 한국 사용자는 HKG에 걸려 실패한다.
+# smart placement는 백엔드(Google)에 가까운 위치로 실행을 옮겨 이 문제를 회피한다.
+[placement]
+mode = "smart"
+
+# Cloudflare Workers AI — Worker 내부에서 실행되므로 지역 차단이 없고 외부 키가 필요 없다.
+[ai]
+binding = "AI"
+
+# 비밀값은 여기에 넣지 말 것 — 반드시 `wrangler secret put` 으로 등록한다.
+#   wrangler secret put GITHUB_TOKEN
+#   wrangler secret put GROQ_API_KEY
+#   wrangler secret put APP_SECRET
+[vars]
+# 분석 1건당 허용 최대 이미지 크기(base64 문자 수). 800px/compress 0.5 사진은 보통 100~250KB.
+MAX_IMAGE_CHARS = "700000"
+# IP당 허용 횟수 / 창(초). RATE_LIMIT KV를 바인딩했을 때만 적용된다.
+RATE_LIMIT_MAX = "30"
+RATE_LIMIT_WINDOW_SEC = "3600"
+
+# (선택) IP별 호출 제한을 켜려면 KV 네임스페이스를 만들어 바인딩한다:
+#   wrangler kv namespace create RATE_LIMIT
+# 그 뒤 출력된 id를 아래에 채우고 주석을 해제한다. 바인딩이 없으면 제한 없이 동작한다.
+# [[kv_namespaces]]
+# binding = "RATE_LIMIT"
+# id = "여기에_KV_ID"

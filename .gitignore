@@ -31,7 +31,17 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
+
+# Cloudflare Worker (server/)
+server/node_modules/
+server/.wrangler/
+server/.dev.vars
+
+# release keystore + signing config (keystore 비밀번호 포함 — 원격에 올리지 말 것)
+release.keystore
+signing.gradle
 
 # typescript
 *.tsbuildinfo
@@ -39,3 +49,6 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Claude Code 로컬 설정 (머신별 권한/경로)
+.claude/settings.local.json
