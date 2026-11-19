@@ -15,6 +15,7 @@ import {
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import mobileAds, {
+  AdsConsent,
   RewardedAd,
   RewardedAdEventType,
   AdEventType,
@@ -198,9 +199,14 @@ export default function App() {
       }
     });
 
-    // AdMob SDK 초기화 후 광고 로드 (실패해도 앱은 계속 동작해야 한다)
-    mobileAds()
-      .initialize()
+    // EEA·영국 사용자는 광고 전에 동의(UMP)를 받아야 한다(AdMob 정책). 해당 지역이 아니거나
+    // AdMob에 개인정보 메시지가 없으면 아무 창도 뜨지 않는다. 동의 처리 실패가 광고를 막진 않는다.
+    // 그다음 SDK 초기화 후 광고 로드 (실패해도 앱은 계속 동작해야 한다)
+    AdsConsent.gatherConsent()
+      .catch((e) => {
+        if (__DEV__) console.warn('[ad] 동의 정보 갱신 실패:', e);
+      })
+      .then(() => mobileAds().initialize())
       .then(loadAd)
       .catch((e) => {
         if (__DEV__) console.warn('[ad] SDK 초기화 실패:', e);

@@ -1,3 +1,5 @@
+import { TestIds } from 'react-native-google-mobile-ads';
+
 // ============================================
 // 분석 프록시 (Cloudflare Worker)
 //
@@ -19,3 +21,8 @@ export const APP_KEY = process.env.EXPO_PUBLIC_APP_KEY ?? '';
 export const ADMOB_REWARDED_ID = __DEV__
   ? 'ca-app-pub-3940256099942544/5224354917' // Google 테스트 광고 ID
   : 'ca-app-pub-3640943750342373/7511562650'; // 실제 리워드 광고 ID
+
+// 결과 화면 배너. 개발 중 실제 ID로 노출·클릭되면 무효 트래픽으로 계정이 정지될 수 있다.
+export const ADMOB_BANNER_ID = __DEV__
+  ? TestIds.ADAPTIVE_BANNER
+  : 'ca-app-pub-3640943750342373/7334509502'; // 실제 "앱배너" 광고 단위

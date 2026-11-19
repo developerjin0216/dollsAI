@@ -20,7 +20,7 @@
 - **Workers AI는 Worker 내부에서 실행되어 이 문제가 없다.** 외부 키도 필요 없다. 그래서 1차로 쓴다.
 - **모델 비교 (2026-11-19, 같은 프롬프트, 실제 매장 사진 800px):**
   Mistral Small 3.1 14~19초 → **1차** / Llama 4 Scout 42~50초(예전 실측 평균 6초에서 크게 느려짐) → 최후 수단 /
-  Gemma 4 26B 100~110초(출력 4,000토큰까지 생성) → 사용 불가 / Llama 3.2 Vision은 Meta 라이선스 `'agree'` 제출 필요.
+  Gemma 4 26B 100~110초(출력 4,000토큰까지 생성) → 사용 불가 / Llama 3.2 11B Vision 107초·입력 11,000토큰·출력 4,000토큰 → 사용 불가(라이선스 동의는 완료됨).
   모델을 바꿀 때는 `wrangler ai models --json` 으로 `vision` 지원과 `planned_deprecation_date` 를 먼저 확인할 것.
 - Groq: `llama-4-scout` 모델 id가 404이고, 이미지 지원 모델(qwen3.6-27b)은 무료 8000 TPM 제한에 걸린다.
 

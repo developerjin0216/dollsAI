@@ -8,8 +8,11 @@ import {
   Image,
   Platform,
   BackHandler,
+  useWindowDimensions,
 } from 'react-native';
+import { BannerAd, BannerAdSize } from 'react-native-google-mobile-ads';
 import { AnalysisResult, Target } from '../services/gemini';
+import { ADMOB_BANNER_ID } from '../constants/Config';
 import ShareCard from './ShareCard';
 import { rememberAnalysis } from './FeedbackPrompt';
 
@@ -195,6 +198,9 @@ function TargetCard({
 
 export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose }: Props) {
   const [sharing, setSharing] = React.useState(false);
+  // 배너를 못 받아오면(no-fill 등) 빈 칸을 남기지 않고 접는다.
+  const [bannerFailed, setBannerFailed] = React.useState(false);
+  const { width: windowWidth } = useWindowDimensions();
   const confidencePercent = Math.round(result.confidence * 100);
   const best = result.bestTarget;
   const noMachine = !!result.noMachine;
@@ -377,6 +383,21 @@ export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose
           <Text style={styles.sectionTitle}>공략 전략</Text>
           <Text style={styles.strategyText}>{result.strategy}</Text>
         </View>
+
+        {/* 배너 광고 — AdMob 정책: 버튼과 떨어진 콘텐츠 사이에 두고 "광고"로 구분한다.
+            결과 화면은 머무는 시간이 길어 분석 용량을 쓰지 않고 노출을 얻는다. */}
+        {!bannerFailed && (
+          <View style={styles.adBox}>
+            <Text style={styles.adLabel}>광고</Text>
+            <BannerAd
+              unitId={ADMOB_BANNER_ID}
+              size={BannerAdSize.INLINE_ADAPTIVE_BANNER}
+              width={Math.floor(windowWidth - 32)}
+              maxHeight={250}
+              onAdFailedToLoad={() => setBannerFailed(true)}
+            />
+          </View>
+        )}
 
         {/* Tips */}
         {result.tips && result.tips.length > 0 && (
@@ -802,6 +823,17 @@ const styles = StyleSheet.create({
   legendItem: {
     color: '#999',
     fontSize: 12,
+  },
+  // Banner ad
+  adBox: {
+    alignItems: 'center',
+    marginVertical: 12,
+  },
+  adLabel: {
+    alignSelf: 'flex-start',
+    color: '#777',
+    fontSize: 11,
+    marginBottom: 4,
   },
   // Retake
   retakeBtn: {
