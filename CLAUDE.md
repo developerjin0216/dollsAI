@@ -41,6 +41,8 @@ Always verify the shipped bundle rather than trusting the build result — extra
 If `expo prebuild --clean` is ever run, the `android/` folder is regenerated and **all custom config is lost**. You must restore:
 1. Release signing config in `android/app/build.gradle` (see `signing.gradle` for the config block)
 2. `android/local.properties` with the correct Android SDK path
+3. In `android/app/src/main/AndroidManifest.xml`: `<uses-feature android:name="android.hardware.screen.portrait" android:required="false"/>` — without it Play infers portrait as *required hardware* from `screenOrientation="portrait"` and **blocks the release from being sent for review** (hit on 1.4.0). Also the `RECORD_AUDIO` `tools:node="remove"` line.
+4. `versionCode`/`versionName` in `android/app/build.gradle` (must match `app.json`; a versionCode that was ever uploaded to Play can't be reused, even if the release was never sent)
 
 ### EAS Build (cloud, only when explicitly requested)
 
