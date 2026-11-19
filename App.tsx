@@ -9,6 +9,9 @@ import {
   Platform,
   StatusBar,
   Image,
+  BackHandler,
+  Linking,
+  AppState as RNAppState,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import mobileAds, {
@@ -17,33 +20,64 @@ import mobileAds, {
   AdEventType,
 } from 'react-native-google-mobile-ads';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
-import { analyzeClawMachine, AnalysisResult } from './src/services/gemini';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Constants from 'expo-constants';
+import {
+  analyzeClawMachine,
+  AnalysisResult,
+  fetchRemoteConfig,
+  DEFAULT_CONFIG,
+  RemoteConfig,
+} from './src/services/gemini';
 import AnalysisOverlay from './src/components/AnalysisOverlay';
 import ErrorBoundary from './src/components/ErrorBoundary';
+import FeedbackPrompt from './src/components/FeedbackPrompt';
 import { ADMOB_REWARDED_ID } from './src/constants/Config';
 
 const rewarded = RewardedAd.createForAdRequest(ADMOB_REWARDED_ID);
 
-const AD_EVERY = 3; // 분석 3회당 1회 광고 (1, 4, 7...번째)
+// 빌드 시 app.json이 앱에 내장된다 — android/app/build.gradle의 versionCode와 같이 올릴 것.
+// 0이면(iOS 등) 버전 비교를 하지 않는다.
+const APP_VERSION_CODE =
+  Platform.OS === 'android' ? Number(Constants.expoConfig?.android?.versionCode ?? 0) : 0;
+const STORE_URL = 'market://details?id=com.dollsai.app';
+const STORE_WEB_URL = 'https://play.google.com/store/apps/details?id=com.dollsai.app';
+
+const openStore = () => {
+  Linking.openURL(STORE_URL).catch(() => Linking.openURL(STORE_WEB_URL).catch(() => {}));
+};
+
+// 광고 주기(분석 N회당 1회)는 서버 /config의 adEvery로 정한다. 받기 전·실패 시 기본 3회.
 const AD_WAIT_TIMEOUT = 5000; // 광고 로드 대기 한도
 const AD_SHOW_WATCHDOG = 8000; // show() 후 아무 이벤트도 안 올 때 결과를 풀어주는 한도
 const AD_RETRY_BASE = 2000; // 로드 실패 재시도 기준 지연
 const AD_MAX_RETRY = 4; // no-fill 무한 요청 루프 방지
+// 광고 주기 카운터를 앱 재시작 후에도 유지한다 — 메모리에만 두면 매 실행 첫 분석마다 광고가 뜬다.
+const ANALYZE_COUNT_KEY = 'analyzeCount';
 
-type AppState = 'camera' | 'analyzing' | 'ad' | 'result';
+// failed: 재시도 가능한 오류로 선택 Alert을 띄운 상태(촬영 사진은 그대로 보인다)
+type AppState = 'camera' | 'analyzing' | 'ad' | 'result' | 'failed';
+// ad 상태 안의 단계: offer = 사용자가 광고 시청을 직접 선택하기 전, loading = 선택 후 로드/표시 대기
+type AdPhase = 'offer' | 'loading';
 
 export default function App() {
-  const [permission, requestPermission] = useCameraPermissions();
+  const [permission, requestPermission, getPermission] = useCameraPermissions();
   const cameraRef = useRef<CameraView>(null);
   const [appState, setAppState] = useState<AppState>('camera');
+  const [adPhase, setAdPhase] = useState<AdPhase>('offer');
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [capturedUri, setCapturedUri] = useState<string | null>(null);
   // 마커 좌표(0~100%)를 사진 위에 정확히 얹으려면 표시 박스가 원본 비율과 같아야 한다.
   const [capturedAspect, setCapturedAspect] = useState(3 / 4);
+  // 원격 설정: 화면 표시용 state + 분석 콜백에서 최신 값을 읽기 위한 ref
+  const [config, setConfig] = useState<RemoteConfig>(DEFAULT_CONFIG);
+  const configRef = useRef<RemoteConfig>(DEFAULT_CONFIG);
   const pendingResultRef = useRef<AnalysisResult | null>(null);
   const analyzeCountRef = useRef(0);
   const waitingForAdRef = useRef(false);
   const busyRef = useRef(false); // 촬영/분석 중복 실행 방지
+  // 분석마다 1씩 올린다. 취소되면 값이 바뀌어, 늦게 도착한 응답을 버릴 수 있다.
+  const analysisIdRef = useRef(0);
   const retryRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -63,6 +97,18 @@ export default function App() {
       pendingResultRef.current = null;
       setAppState('result');
     }
+  }, [clearWatchdog]);
+
+  // 카메라로 완전히 되돌린다. 진행 중인 분석이 있으면 그 응답은 analysisIdRef로 무시된다.
+  const resetToCamera = useCallback(() => {
+    analysisIdRef.current += 1;
+    busyRef.current = false;
+    clearWatchdog();
+    pendingResultRef.current = null;
+    waitingForAdRef.current = false;
+    setAnalysisResult(null);
+    setCapturedUri(null);
+    setAppState('camera');
   }, [clearWatchdog]);
 
   // 라이브러리의 load()는 이미 로드됐거나 요청이 진행 중이면 조용히 무시된다.
@@ -94,6 +140,23 @@ export default function App() {
       return false;
     }
   }, [revealResult, clearWatchdog]);
+
+  useEffect(() => {
+    fetchRemoteConfig().then((c) => {
+      configRef.current = c;
+      setConfig(c);
+    });
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(ANALYZE_COUNT_KEY)
+      .then((v) => {
+        const n = parseInt(v ?? '0', 10);
+        // 읽기 전에 이미 분석이 끝났을 수 있으므로 큰 값을 유지한다.
+        if (Number.isFinite(n)) analyzeCountRef.current = Math.max(analyzeCountRef.current, n);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const unsubLoaded = rewarded.addAdEventListener(RewardedAdEventType.LOADED, () => {
@@ -154,11 +217,84 @@ export default function App() {
     };
   }, [showAd, revealResult, loadAd, clearWatchdog]);
 
+  // 설정 앱에서 권한을 켜고 돌아오면 다시 확인한다 (훅은 자동으로 갱신하지 않는다).
+  useEffect(() => {
+    const sub = RNAppState.addEventListener('change', (s) => {
+      if (s === 'active' && permission && !permission.granted) getPermission();
+    });
+    return () => sub.remove();
+  }, [permission, getPermission]);
+
+  // 리사이즈된 사진(base64)을 분석하고 광고/결과 흐름으로 넘긴다. 실패 시 같은 사진으로 재시도할 수 있다.
+  const runAnalysis = useCallback(
+    async (image: string) => {
+      const id = ++analysisIdRef.current;
+      busyRef.current = true;
+      setAppState('analyzing');
+
+      try {
+        const result = await analyzeClawMachine(image);
+        if (id !== analysisIdRef.current) return; // 사용자가 취소함
+        pendingResultRef.current = result;
+
+        // 기계를 못 찾은 사진은 재촬영 안내만 보여준다 — 광고도, 광고 주기 카운트도 없다.
+        if (result.noMachine) {
+          revealResult();
+          loadAd();
+          return;
+        }
+
+        analyzeCountRef.current += 1;
+        AsyncStorage.setItem(ANALYZE_COUNT_KEY, String(analyzeCountRef.current)).catch(() => {});
+
+        // 분석 N회당 1회 광고 — 1번째부터 표시(N=3이면 1, 4, 7...)해 첫 실행에서도 광고가 동작한다.
+        // N이 0 이하면 서버에서 광고를 끈 것이다.
+        const adEvery = configRef.current.adEvery;
+        const shouldShowAd = adEvery > 0 && (analyzeCountRef.current - 1) % adEvery === 0;
+        if (!shouldShowAd) {
+          revealResult();
+          loadAd(); // 다음 차례를 위해 미리 로드
+          return;
+        }
+
+        // 보상형 광고는 사용자가 직접 시청을 선택해야 한다(AdMob 정책) → 선택 화면을 먼저 띄운다.
+        setAdPhase('offer');
+        setAppState('ad');
+        loadAd();
+      } catch (error: any) {
+        if (id !== analysisIdRef.current) return;
+        pendingResultRef.current = null;
+        const message = error?.message || '인형뽑기 기계를 분석하는데 실패했습니다.\n다시 시도해주세요.';
+        if (error?.retryable) {
+          setAppState('failed');
+          Alert.alert(
+            '분석 실패',
+            message,
+            [
+              { text: '다시 찍기', style: 'cancel', onPress: resetToCamera },
+              { text: '같은 사진으로 재시도', onPress: () => runAnalysis(image) },
+            ],
+            { cancelable: false }
+          );
+        } else {
+          resetToCamera();
+          Alert.alert('분석 실패', message);
+        }
+      } finally {
+        if (id === analysisIdRef.current) busyRef.current = false;
+      }
+    },
+    [loadAd, revealResult, resetToCamera]
+  );
+
   const handleAnalyze = useCallback(async () => {
     // appState 검사는 await 이전 값이라 연타를 막지 못한다 → ref로 실제 진행 여부를 잠근다.
     if (busyRef.current || !cameraRef.current || appState !== 'camera') return;
     busyRef.current = true;
+    // 리사이즈 도중 "취소"를 누르면 resetToCamera가 id를 올린다 → 이후 단계로 넘어가지 않는다.
+    const startId = analysisIdRef.current;
 
+    let image: string;
     try {
       // 사진 촬영
       const photo = await cameraRef.current.takePictureAsync({
@@ -191,71 +327,76 @@ export default function App() {
       if (resized.width && resized.height) {
         setCapturedAspect(resized.width / resized.height);
       }
-
-      // AI 분석
-      const result = await analyzeClawMachine(resized.base64);
-      pendingResultRef.current = result;
-      analyzeCountRef.current += 1;
-
-      // 분석 3회당 1회 광고 — 1번째부터 표시(1, 4, 7...)해 첫 실행에서도 광고가 동작한다.
-      const shouldShowAd = (analyzeCountRef.current - 1) % AD_EVERY === 0;
-
-      if (!shouldShowAd) {
-        revealResult();
-        loadAd(); // 다음 차례를 위해 미리 로드
-        return;
-      }
-
-      setAppState('ad');
-      if (rewarded.loaded) {
-        if (!showAd()) {
-          // 표시 실패 → 결과부터 보여주고 다음 광고를 다시 로드
-          revealResult();
-          loadAd();
-        }
-      } else {
-        // 로드 대기 (완료되면 LOADED 리스너가 자동 표시)
-        waitingForAdRef.current = true;
-        loadAd();
-        setTimeout(() => {
-          if (waitingForAdRef.current) {
-            waitingForAdRef.current = false;
-            revealResult();
-          }
-        }, AD_WAIT_TIMEOUT);
-      }
+      image = resized.base64;
     } catch (error: any) {
-      setAppState('camera');
-      setCapturedUri(null);
-      pendingResultRef.current = null;
-      Alert.alert(
-        '분석 실패',
-        error?.message || '인형뽑기 기계를 분석하는데 실패했습니다.\n다시 시도해주세요.'
-      );
-    } finally {
-      busyRef.current = false;
+      if (startId !== analysisIdRef.current) return;
+      resetToCamera();
+      Alert.alert('촬영 실패', error?.message || '사진을 처리하지 못했습니다.\n다시 시도해주세요.');
+      return;
     }
-  }, [appState, loadAd, showAd, revealResult]);
 
-  const handleCloseResult = useCallback(() => {
-    setAnalysisResult(null);
-    setCapturedUri(null);
-    setAppState('camera');
-  }, []);
+    if (startId !== analysisIdRef.current) return;
+    await runAnalysis(image);
+  }, [appState, runAnalysis, resetToCamera]);
 
-  // 렌더 오류(ErrorBoundary) 복구: 문제를 일으켰을 수 있는 결과/보류 데이터를
-  // 전부 비우고 카메라 상태로 완전히 되돌린다.
-  const handleErrorReset = useCallback(() => {
-    clearWatchdog();
-    pendingResultRef.current = null;
-    waitingForAdRef.current = false;
-    setAnalysisResult(null);
-    setCapturedUri(null);
-    setAppState('camera');
-  }, [clearWatchdog]);
+  // 사용자가 광고 시청을 선택함
+  const handleWatchAd = useCallback(() => {
+    setAdPhase('loading');
+    if (rewarded.loaded) {
+      if (!showAd()) {
+        // 표시 실패 → 결과부터 보여주고 다음 광고를 다시 로드
+        revealResult();
+        loadAd();
+      }
+      return;
+    }
+    // 로드 대기 (완료되면 LOADED 리스너가 자동 표시)
+    waitingForAdRef.current = true;
+    loadAd();
+    setTimeout(() => {
+      if (waitingForAdRef.current) {
+        waitingForAdRef.current = false;
+        revealResult();
+      }
+    }, AD_WAIT_TIMEOUT);
+  }, [showAd, revealResult, loadAd]);
+
+  // 안드로이드 뒤로가기: 기본 동작은 앱 종료라 분석 도중 누르면 결과가 통째로 사라진다.
+  // 결과 화면은 AnalysisOverlay가 직접 처리한다(공유 카드부터 닫아야 하므로).
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (appState === 'analyzing' || appState === 'failed') {
+        resetToCamera();
+        return true;
+      }
+      if (appState === 'ad') {
+        // 광고 표시 대기 중에는 무시, 선택 화면에서는 "다시 찍기"와 같다
+        if (adPhase === 'offer') resetToCamera();
+        return true;
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [appState, adPhase, resetToCamera]);
 
   // 카메라가 아닌 상태 = 촬영 이미지 고정 표시
   const showFrozenImage = appState !== 'camera' && capturedUri;
+  const updateAvailable = APP_VERSION_CODE > 0 && APP_VERSION_CODE < config.latestVersionCode;
+
+  // 서버 응답 형식을 깨는 변경 등으로 구버전을 더 지원할 수 없을 때 서버에서 올린다(MIN_VERSION_CODE).
+  if (APP_VERSION_CODE > 0 && APP_VERSION_CODE < config.minVersionCode) {
+    return (
+      <View style={styles.centered}>
+        <Text style={styles.permTitle}>업데이트가 필요해요</Text>
+        <Text style={styles.permDesc}>
+          분석 서버가 새 버전으로 바뀌었어요.{'\n'}최신 버전으로 업데이트한 뒤 이용해주세요.
+        </Text>
+        <TouchableOpacity style={styles.permBtn} onPress={openStore}>
+          <Text style={styles.permBtnText}>업데이트하기</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   if (!permission) {
     return (
@@ -266,53 +407,71 @@ export default function App() {
   }
 
   if (!permission.granted) {
+    // "다시 묻지 않음" 상태에서는 requestPermission()이 아무 창도 띄우지 않는다 → 설정으로 보낸다
+    const blocked = !permission.canAskAgain;
     return (
       <View style={styles.centered}>
         <Text style={styles.permTitle}>카메라 권한 필요</Text>
         <Text style={styles.permDesc}>
           인형뽑기 기계를 분석하려면{'\n'}카메라 접근 권한이 필요합니다.
+          {blocked && '\n\n설정 > 권한에서 카메라를 허용해주세요.'}
         </Text>
-        <TouchableOpacity style={styles.permBtn} onPress={requestPermission}>
-          <Text style={styles.permBtnText}>권한 허용하기</Text>
+        <TouchableOpacity
+          style={styles.permBtn}
+          onPress={blocked ? () => Linking.openSettings() : requestPermission}
+        >
+          <Text style={styles.permBtnText}>{blocked ? '설정 열기' : '권한 허용하기'}</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
   return (
-    <ErrorBoundary onReset={handleErrorReset}>
+    <ErrorBoundary onReset={resetToCamera}>
       <View style={styles.container}>
         <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
-        {/* 카메라 뷰 (항상 뒤에 유지) */}
-        <CameraView ref={cameraRef} style={styles.camera} facing="back">
-          {!showFrozenImage && (
-            <>
-              <View style={styles.topBar}>
-                <Text style={styles.appTitle}>뽑기 AI</Text>
-                <Text style={styles.appSubtitle}>인형뽑기 기계를 비추세요</Text>
-              </View>
-
-              <View style={styles.guideFrame}>
-                <View style={[styles.corner, styles.cornerTL]} />
-                <View style={[styles.corner, styles.cornerTR]} />
-                <View style={[styles.corner, styles.cornerBL]} />
-                <View style={[styles.corner, styles.cornerBR]} />
-              </View>
-
-              <View style={styles.bottomBar}>
-                <TouchableOpacity style={styles.analyzeBtn} onPress={handleAnalyze}>
-                  <View style={styles.analyzeBtnInner}>
-                    <Text style={styles.analyzeBtnIcon}>O</Text>
-                  </View>
-                  <Text style={styles.analyzeBtnText}>분석하기</Text>
+        {/* 카메라 뷰 — 촬영 화면에서만 켠다(결과를 보는 동안 계속 돌면 발열·배터리 소모) */}
+        {appState === 'camera' ? (
+          <CameraView ref={cameraRef} style={styles.camera} facing="back">
+            <View style={styles.topBar}>
+              <Text style={styles.appTitle}>뽑기 AI</Text>
+              <Text style={styles.appSubtitle}>인형뽑기 기계를 비추세요</Text>
+              {!!config.notice && <Text style={styles.notice}>{config.notice}</Text>}
+              {updateAvailable && (
+                <TouchableOpacity onPress={openStore}>
+                  <Text style={styles.updateBanner}>새 버전이 나왔어요 · 업데이트 ›</Text>
                 </TouchableOpacity>
-              </View>
-            </>
-          )}
-        </CameraView>
+              )}
+            </View>
 
-        {/* 촬영된 이미지 (분석중/결과 상태에서 카메라 위에 덮음) */}
+            <FeedbackPrompt />
+
+            <View style={styles.guideFrame}>
+              <View style={[styles.corner, styles.cornerTL]} />
+              <View style={[styles.corner, styles.cornerTR]} />
+              <View style={[styles.corner, styles.cornerBL]} />
+              <View style={[styles.corner, styles.cornerBR]} />
+            </View>
+
+            <View style={styles.bottomBar}>
+              <View style={styles.guideTips}>
+                <Text style={styles.guideTip}>· 집게와 출구(투입구)가 한 화면에 나오게</Text>
+                <Text style={styles.guideTip}>· 렌즈를 유리에 가까이 대면 반사가 줄어요</Text>
+              </View>
+              <TouchableOpacity style={styles.analyzeBtn} onPress={handleAnalyze}>
+                <View style={styles.analyzeBtnInner}>
+                  <Text style={styles.analyzeBtnIcon}>O</Text>
+                </View>
+                <Text style={styles.analyzeBtnText}>분석하기</Text>
+              </TouchableOpacity>
+            </View>
+          </CameraView>
+        ) : (
+          <View style={styles.camera} />
+        )}
+
+        {/* 촬영된 이미지 (분석중/결과 상태에서 카메라 자리에 표시) */}
         {showFrozenImage && (
           <Image source={{ uri: capturedUri }} style={styles.frozenImage} resizeMode="cover" />
         )}
@@ -326,17 +485,36 @@ export default function App() {
               <Text style={styles.analyzingSubtext}>
                 인형 위치, 크기, 형태를 분석하고 있습니다
               </Text>
+              <Text style={styles.analyzingSubtext}>보통 5~10초 걸려요</Text>
+              <TouchableOpacity style={styles.cancelBtn} onPress={resetToCamera}>
+                <Text style={styles.cancelBtnText}>취소</Text>
+              </TouchableOpacity>
             </View>
           </View>
         )}
 
-        {/* 광고 대기 오버레이 */}
+        {/* 광고: 시청 선택 화면 → 선택 후 로드/표시 대기 */}
         {appState === 'ad' && (
           <View style={styles.analyzingOverlay}>
-            <View style={styles.analyzingCard}>
-              <ActivityIndicator size="small" color="#ffab00" />
-              <Text style={styles.analyzingText}>잠시만 기다려주세요...</Text>
-            </View>
+            {adPhase === 'offer' ? (
+              <View style={styles.analyzingCard}>
+                <Text style={styles.offerTitle}>분석 완료!</Text>
+                <Text style={styles.offerDesc}>
+                  짧은 광고를 보면{'\n'}추천 타겟과 공략법을 확인할 수 있어요
+                </Text>
+                <TouchableOpacity style={styles.offerBtn} onPress={handleWatchAd}>
+                  <Text style={styles.offerBtnText}>광고 보고 결과 확인</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.cancelBtn} onPress={resetToCamera}>
+                  <Text style={styles.cancelBtnText}>다시 찍기</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={styles.analyzingCard}>
+                <ActivityIndicator size="small" color="#ffab00" />
+                <Text style={styles.analyzingText}>광고를 불러오는 중...</Text>
+              </View>
+            )}
           </View>
         )}
 
@@ -346,7 +524,7 @@ export default function App() {
             result={analysisResult}
             imageUri={capturedUri}
             imageAspect={capturedAspect}
-            onClose={handleCloseResult}
+            onClose={resetToCamera}
           />
         )}
       </View>
@@ -394,6 +572,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginTop: 4,
   },
+  notice: {
+    color: '#ffd54f',
+    fontSize: 13,
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  updateBanner: {
+    color: '#00e676',
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 8,
+  },
   // 가이드 프레임
   guideFrame: {
     flex: 1,
@@ -435,9 +625,17 @@ const styles = StyleSheet.create({
   // 하단 바
   bottomBar: {
     paddingBottom: Platform.OS === 'ios' ? 40 : 24,
-    paddingTop: 16,
+    paddingTop: 12,
     backgroundColor: 'rgba(0,0,0,0.5)',
     alignItems: 'center',
+  },
+  guideTips: {
+    marginBottom: 12,
+  },
+  guideTip: {
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 12,
+    lineHeight: 18,
   },
   analyzeBtn: {
     alignItems: 'center',
@@ -491,6 +689,41 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.6)',
     fontSize: 12,
     marginTop: 6,
+  },
+  cancelBtn: {
+    marginTop: 18,
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+  },
+  cancelBtnText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 14,
+    textDecorationLine: 'underline',
+  },
+  // 광고 시청 선택
+  offerTitle: {
+    color: '#00e676',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  offerDesc: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 14,
+    lineHeight: 21,
+    textAlign: 'center',
+    marginTop: 10,
+  },
+  offerBtn: {
+    marginTop: 20,
+    backgroundColor: '#00e676',
+    paddingHorizontal: 28,
+    paddingVertical: 14,
+    borderRadius: 12,
+  },
+  offerBtnText: {
+    color: '#000',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
   // 권한 화면
   permTitle: {

@@ -7,9 +7,11 @@ import {
   TouchableOpacity,
   Image,
   Platform,
+  BackHandler,
 } from 'react-native';
 import { AnalysisResult, Target } from '../services/gemini';
 import ShareCard from './ShareCard';
+import { rememberAnalysis } from './FeedbackPrompt';
 
 interface Props {
   result: AnalysisResult;
@@ -63,6 +65,15 @@ const typeLabel = (t: string) => {
 
 const rateColor = (r: number) =>
   r >= 70 ? '#00e676' : r >= 40 ? '#ffab00' : '#ff1744';
+
+// 프롬프트가 grabDetail을 "1) … 2) … 3) …" 한 문단으로 주므로 단계별 줄로 나눈다. 번호가 없으면 원문 그대로.
+function splitSteps(text: string): string[] {
+  const parts = text
+    .split(/\s*(?=\b[1-9]\)\s?)/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length > 1 ? parts : [text];
+}
 
 function TargetMarker({
   target,
@@ -171,7 +182,11 @@ function TargetCard({
       {target.grabDetail && (
         <View style={styles.grabDetailBox}>
           <Text style={styles.grabDetailLabel}>상세 공략법</Text>
-          <Text style={styles.grabDetailText}>{target.grabDetail}</Text>
+          {splitSteps(target.grabDetail).map((step, i) => (
+            <Text key={i} style={styles.grabDetailText}>
+              {step}
+            </Text>
+          ))}
         </View>
       )}
     </View>
@@ -181,6 +196,23 @@ function TargetCard({
 export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose }: Props) {
   const [sharing, setSharing] = React.useState(false);
   const confidencePercent = Math.round(result.confidence * 100);
+  const best = result.bestTarget;
+  const noMachine = !!result.noMachine;
+
+  // 실제로 화면에 보여준 결과만 "다음에 성공 여부 묻기" 대상으로 기록한다.
+  React.useEffect(() => {
+    rememberAnalysis(result);
+  }, [result]);
+
+  // 안드로이드 뒤로가기: 공유 카드가 열려 있으면 그것부터 닫고, 아니면 카메라로 돌아간다.
+  React.useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (sharing) setSharing(false);
+      else onClose();
+      return true;
+    });
+    return () => sub.remove();
+  }, [sharing, onClose]);
   const claw = result.claw;
   // 사진 비율이 없으면 4:3으로 가정 (마커가 어긋나지 않도록 contain으로 렌더)
   const aspect = imageAspect && imageAspect > 0 ? imageAspect : 4 / 3;
@@ -220,6 +252,33 @@ export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose
       </View>
 
       <ScrollView style={styles.scrollArea} showsVerticalScrollIndicator={false}>
+        {/* 요약 — 사진이 첫 화면을 거의 다 차지하므로 가장 중요한 정보를 사진 위에 둔다 */}
+        {noMachine ? (
+          <View style={styles.noMachineBox}>
+            <Text style={styles.noMachineTitle}>인형뽑기 기계를 찾지 못했어요</Text>
+            <Text style={styles.noMachineDesc}>
+              집게와 상품, 출구(투입구)가 함께 보이도록 기계 정면에서 다시 찍어주세요.
+            </Text>
+          </View>
+        ) : (
+          <View style={styles.summary}>
+            <View style={styles.summaryRow}>
+              <Text style={styles.summaryStar}>{'★'}</Text>
+              <Text style={styles.summaryName} numberOfLines={1}>
+                {best.name}
+              </Text>
+              <Text style={[styles.summaryRate, { color: rateColor(best.successRate) }]}>
+                {best.successRate}%
+              </Text>
+            </View>
+            {!!best.grabPoint && (
+              <Text style={styles.summaryGrab} numberOfLines={2}>
+                집게 포인트 · {best.grabPoint}
+              </Text>
+            )}
+          </View>
+        )}
+
         {/* Image with markers */}
         <View style={[styles.imageContainer, { aspectRatio: aspect }]}>
           <Image
@@ -227,8 +286,8 @@ export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose
             style={styles.image}
             resizeMode="contain"
           />
-          {/* Claw marker */}
-          {claw && (
+          {/* 기계 미검출이면 마커 좌표가 의미 없으므로 그리지 않는다 */}
+          {!noMachine && claw && (
             <View
               style={[
                 styles.clawMarker,
@@ -241,13 +300,29 @@ export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose
               <Text style={styles.clawMarkerText}>{'\u2B07'}</Text>
             </View>
           )}
-          {/* Best target marker */}
-          <TargetMarker target={result.bestTarget} index={0} isBest />
-          {/* Other target markers */}
-          {otherTargets.map((target, i) => (
-            <TargetMarker key={i} target={target} index={i} isBest={false} />
-          ))}
+          {!noMachine && (
+            <>
+              {/* Best target marker */}
+              <TargetMarker target={result.bestTarget} index={0} isBest />
+              {/* Other target markers */}
+              {otherTargets.map((target, i) => (
+                <TargetMarker key={i} target={target} index={i} isBest={false} />
+              ))}
+            </>
+          )}
         </View>
+
+        {!noMachine && (
+          <View style={styles.legend}>
+            <Text style={styles.legendItem}>
+              <Text style={{ color: '#e040fb' }}>{'⬇'}</Text> 집게 위치
+            </Text>
+            <Text style={styles.legendItem}>
+              <Text style={{ color: '#00e676' }}>{'★'}</Text> 추천 타겟
+            </Text>
+            {otherTargets.length > 0 && <Text style={styles.legendItem}>1·2·3 기타 후보</Text>}
+          </View>
+        )}
 
         {/* Claw Info */}
         {claw && (
@@ -271,26 +346,28 @@ export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose
         )}
 
         {/* Confidence */}
-        <View style={styles.confidenceBar}>
-          <Text style={styles.confidenceLabel}>성공 확률</Text>
-          <View style={styles.confidenceTrack}>
-            <View
-              style={[
-                styles.confidenceFill,
-                {
-                  width: `${confidencePercent}%`,
-                  backgroundColor:
-                    confidencePercent >= 70
-                      ? '#00e676'
-                      : confidencePercent >= 40
-                        ? '#ffab00'
-                        : '#ff1744',
-                },
-              ]}
-            />
+        {!noMachine && (
+          <View style={styles.confidenceBar}>
+            <Text style={styles.confidenceLabel}>성공 확률</Text>
+            <View style={styles.confidenceTrack}>
+              <View
+                style={[
+                  styles.confidenceFill,
+                  {
+                    width: `${confidencePercent}%`,
+                    backgroundColor:
+                      confidencePercent >= 70
+                        ? '#00e676'
+                        : confidencePercent >= 40
+                          ? '#ffab00'
+                          : '#ff1744',
+                  },
+                ]}
+              />
+            </View>
+            <Text style={styles.confidenceText}>{confidencePercent}%</Text>
           </View>
-          <Text style={styles.confidenceText}>{confidencePercent}%</Text>
-        </View>
+        )}
 
         {/* Best Target */}
         <TargetCard target={result.bestTarget} index={0} isBest />
@@ -326,11 +403,16 @@ export default function AnalysisOverlay({ result, imageUri, imageAspect, onClose
           </>
         )}
 
+        <TouchableOpacity style={styles.retakeBtn} onPress={onClose}>
+          <Text style={styles.retakeBtnText}>다시 찍기</Text>
+        </TouchableOpacity>
+
         {result.apiSource && (
           <Text style={styles.apiSource}>Powered by {result.apiSource}</Text>
         )}
 
-        <View style={{ height: 40 }} />
+        {/* 안전 영역 인셋을 모르므로(edge-to-edge) 내비게이션 바에 가리지 않도록 넉넉히 비운다 */}
+        <View style={{ height: 80 }} />
       </ScrollView>
 
       {sharing && (
@@ -655,5 +737,83 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textAlign: 'center' as const,
     marginTop: 16,
+  },
+  // Summary
+  summary: {
+    backgroundColor: 'rgba(0,230,118,0.1)',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+    borderLeftWidth: 3,
+    borderLeftColor: '#00e676',
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  summaryStar: {
+    color: '#00e676',
+    fontSize: 18,
+  },
+  summaryName: {
+    flex: 1,
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  summaryRate: {
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  summaryGrab: {
+    color: '#ffcc80',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 6,
+  },
+  noMachineBox: {
+    backgroundColor: 'rgba(255,171,0,0.12)',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    borderLeftWidth: 3,
+    borderLeftColor: '#ffab00',
+  },
+  noMachineTitle: {
+    color: '#ffab00',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  noMachineDesc: {
+    color: '#ddd',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 6,
+  },
+  // Legend
+  legend: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 14,
+    marginTop: -8,
+    marginBottom: 14,
+  },
+  legendItem: {
+    color: '#999',
+    fontSize: 12,
+  },
+  // Retake
+  retakeBtn: {
+    marginTop: 20,
+    backgroundColor: '#00e676',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  retakeBtnText: {
+    color: '#000',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
 });

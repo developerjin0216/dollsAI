@@ -2,7 +2,7 @@
   "expo": {
     "name": "뽑기 AI",
     "slug": "dollsAI",
-    "version": "1.3.4",
+    "version": "1.4.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -26,7 +26,7 @@
       },
       "edgeToEdgeEnabled": true,
       "package": "com.dollsai.app",
-      "versionCode": 13,
+      "versionCode": 14,
       "permissions": ["CAMERA"],
       "blockedPermissions": ["android.permission.RECORD_AUDIO"]
     },
