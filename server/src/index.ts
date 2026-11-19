@@ -25,12 +25,14 @@ interface Provider {
   url?: string;
   key?: string;
   extra?: Record<string, unknown>;
+  /** 호출 제한(ms). 없으면 'http' = PER_CALL_TIMEOUT, 'binding' = BINDING_TIMEOUT */
+  timeoutMs?: number;
 }
 
 const PER_CALL_TIMEOUT = 25000;
-// Workers AI(Llama 4 Scout)는 실측 32~46초+ 가 걸린다(2026-11-19, NRT, 이전 기록은 평균 6초).
-// 25초·40초로 자르면 대부분 지역 차단된 Gemini로 넘어가 실패했다. Gemini 폴백은 사실상 성공하지 못하므로
-// Llama에 앱이 기다리는 시간(1.4.0+: 60초, 1.3.4 이하: 45초)을 거의 다 준다.
+// Workers AI(Llama 4 Scout)는 실측 32~50초가 걸린다(2026-11-19, NRT, 이전 기록은 평균 6초).
+// 25초·40초로 자르면 대부분 지역 차단된 Gemini로 넘어가 실패했다 → 앱이 기다리는 시간
+// (1.4.0+: 60초, 1.3.4 이하: 45초)을 거의 다 준다.
 const BINDING_TIMEOUT = 55000;
 
 // Gemini 2.5 Flash (OpenAI 호환 엔드포인트). 무료 할당량이 있고 비전·한국어·JSON을 지원한다.
@@ -44,13 +46,21 @@ const BINDING_TIMEOUT = 55000;
 //
 // 유료 폴백(Claude·OpenAI)을 붙이려면 이 배열에 항목을 추가하기만 하면 된다.
 function providers(env: Env): Provider[] {
+  // 1차: Mistral Small 3.1 (Workers AI). 같은 프롬프트·실사진 비교(2026-11-19)에서 14~19초로
+  // Llama 4 Scout(42~50초)보다 약 3배 빨랐고, JSON 유효성·분석 수준은 비슷했다.
+  // Gemma 4 26B는 100초+ (출력 4,000토큰까지 생성), Llama 3.2 Vision은 Meta 라이선스 'agree' 제출이 필요하다.
+  // Worker 내부 실행이라 지역 차단이 없고 외부 키도 필요 없다.
   const list: Provider[] = [
-    // 1차: Cloudflare Workers AI. Worker 내부에서 실행되어 지역 차단이 없고 외부 키도 필요 없다.
-    { name: 'Llama 4 Scout (Workers AI)', kind: 'binding', model: '@cf/meta/llama-4-scout-17b-16e-instruct' },
+    {
+      name: 'Mistral Small 3.1 (Workers AI)',
+      kind: 'binding',
+      model: '@cf/mistralai/mistral-small-3.1-24b-instruct',
+      timeoutMs: 30000,
+    },
   ];
   // 2차(선택): Gemini. ⚠️ Cloudflare 콜로가 HKG면 Google이 400
-  // "User location is not supported for the API use." 를 반환하므로 한국 사용자에겐 대부분 실패한다.
-  // 미국 리전 호스팅을 경유할 때만 실효가 있다. 키가 없으면 자동으로 건너뛴다.
+  // "User location is not supported for the API use." 를 반환하므로 한국 사용자에겐 자주 실패한다.
+  // 실패는 즉시 나므로 느린 Llama보다 먼저 시도한다. 키가 없으면 자동으로 건너뛴다.
   if (env.GEMINI_API_KEY) {
     list.push({
       name: 'Gemini 2.5 Flash',
@@ -61,6 +71,8 @@ function providers(env: Env): Provider[] {
       extra: { reasoning_effort: 'low' },
     });
   }
+  // 마지막: Llama 4 Scout. 느리지만(40초+) 지역 제한이 없는 최후 수단.
+  list.push({ name: 'Llama 4 Scout (Workers AI)', kind: 'binding', model: '@cf/meta/llama-4-scout-17b-16e-instruct' });
   return list;
 }
 
@@ -105,6 +117,42 @@ export function extractJson(raw: string): string {
   return s.slice(start);
 }
 
+// extractJson 결과가 파싱되지 않을 때만 쓰는 괄호 짝 복구.
+// Mistral은 끝의 tips 배열을 `]` 없이 `"}` 로 닫는 실수를 한다(2026-11-19 실측) — 내용은 멀쩡한데 버리면
+// 40초 걸리는 Llama로 넘어간다. 문자열 밖의 괄호만 스택으로 맞춘다:
+// 배열이 열린 채 `}` 가 오면 `]` 를 끼워 넣고, 짝 없는 `]` 는 버리고, 끝까지 안 닫힌 것은 닫아 준다.
+export function repairJson(s: string): string {
+  const stack: string[] = [];
+  let out = '';
+  let inStr = false;
+  let esc = false;
+  for (const ch of s) {
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') {
+      while (stack.length && stack[stack.length - 1] !== ch) {
+        if (ch === '}' && stack[stack.length - 1] === ']') out += stack.pop();
+        else break;
+      }
+      if (stack[stack.length - 1] !== ch) continue; // 짝 없는 닫는 괄호는 버린다
+      stack.pop();
+      out += ch;
+      if (stack.length === 0) return out;
+      continue;
+    }
+    out += ch;
+  }
+  return out + (inStr ? '"' : '') + stack.reverse().join('');
+}
+
 function num(v: unknown, fallback: number): number {
   const n = typeof v === 'string' ? parseFloat(v) : Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -141,6 +189,25 @@ function normalize(parsed: any) {
   parsed.targets = (Array.isArray(parsed.targets) ? parsed.targets : [])
     .filter((t: any) => t && typeof t === 'object')
     .map(normalizeTarget);
+
+  // 프롬프트 규칙("bestTarget = 승률 최고", "60 이상은 전체에서 최대 1개", "targets 는 성공률 내림차순")을
+  // 모델이 자주 어긴다(Mistral이 best 40 + target 50 을 냈다). 앱은 bestTarget에 별표를, targets 순서대로
+  // 1·2·3 번호를 붙이므로 여기서 강제한다.
+  const top = parsed.targets.reduce(
+    (m: any, t: any) => (!m || t.successRate > m.successRate ? t : m),
+    null
+  );
+  if (top && top.successRate > parsed.bestTarget.successRate) {
+    parsed.targets = parsed.targets.filter((t: any) => t !== top).concat([parsed.bestTarget]);
+    parsed.bestTarget = top;
+  }
+  for (const t of parsed.targets) {
+    if (t.successRate >= 60) {
+      t.successRate = 55;
+      t.difficulty = 'medium';
+    }
+  }
+  parsed.targets.sort((a: any, b: any) => b.successRate - a.successRate);
 
   const claw = parsed.claw && typeof parsed.claw === 'object' ? parsed.claw : {};
   parsed.claw = {
@@ -201,7 +268,7 @@ async function callProvider(p: Provider, image: string, colo: string, env: Env):
             const e = new Error('TIMEOUT');
             e.name = 'AbortError';
             reject(e);
-          }, BINDING_TIMEOUT);
+          }, p.timeoutMs ?? BINDING_TIMEOUT);
         }),
       ]);
     } catch (err: any) {
@@ -222,7 +289,7 @@ async function callProvider(p: Provider, image: string, colo: string, env: Env):
     text = typeof c?.message?.content === 'string' ? c.message.content : (out?.response ?? '');
   } else {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), PER_CALL_TIMEOUT);
+    const timer = setTimeout(() => controller.abort(), p.timeoutMs ?? PER_CALL_TIMEOUT);
     try {
       const res = await fetch(p.url!, {
         method: 'POST',
@@ -261,7 +328,14 @@ async function callProvider(p: Provider, image: string, colo: string, env: Env):
   if (!text) throw new Error('EMPTY');
   if (finishReason === 'length') throw new Error('TRUNCATED');
 
-  const parsed = JSON.parse(extractJson(String(text)));
+  const extracted = extractJson(String(text));
+  let parsed: any;
+  try {
+    parsed = JSON.parse(extracted);
+  } catch {
+    parsed = JSON.parse(repairJson(extracted));
+    console.warn(`${p.name}: 괄호 짝 복구 후 파싱 성공`);
+  }
   if (!parsed?.bestTarget || typeof parsed.bestTarget !== 'object' || !parsed.strategy) {
     throw new Error('PARSE_ERROR');
   }

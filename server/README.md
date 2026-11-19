@@ -4,8 +4,9 @@
 비전 모델 호출·프롬프트·응답 정규화가 모두 여기서 일어나고, 앱은 사진만 보냅니다.
 
 ```
-앱 ──POST /analyze { image }──▶ Worker ──▶ Workers AI: Llama 4 Scout  (1차, 무료·키 불필요)
-                                      └──▶ Gemini 2.5 Flash           (2차, 키 있을 때만)
+앱 ──POST /analyze { image }──▶ Worker ──▶ Workers AI: Mistral Small 3.1 (1차, 무료·키 불필요, 14~19초)
+                                      ├──▶ Gemini 2.5 Flash              (2차, 키 있을 때만, 지역 차단 시 즉시 실패)
+                                      └──▶ Workers AI: Llama 4 Scout     (최후 수단, 40초+)
 ```
 
 ### 공급자 이력 — 되돌리지 말 것
@@ -17,14 +18,20 @@
   `400 FAILED_PRECONDITION "User location is not supported for the API use."` 를 반환한다.
   `[placement] mode = "smart"` 로도 해결되지 않았다(6/6 실패). 미국 리전 호스팅을 경유할 때만 쓸 수 있다.
 - **Workers AI는 Worker 내부에서 실행되어 이 문제가 없다.** 외부 키도 필요 없다. 그래서 1차로 쓴다.
-  실측 8/8 성공, 평균 6.0초.
+- **모델 비교 (2026-11-19, 같은 프롬프트, 실제 매장 사진 800px):**
+  Mistral Small 3.1 14~19초 → **1차** / Llama 4 Scout 42~50초(예전 실측 평균 6초에서 크게 느려짐) → 최후 수단 /
+  Gemma 4 26B 100~110초(출력 4,000토큰까지 생성) → 사용 불가 / Llama 3.2 Vision은 Meta 라이선스 `'agree'` 제출 필요.
+  모델을 바꿀 때는 `wrangler ai models --json` 으로 `vision` 지원과 `planned_deprecation_date` 를 먼저 확인할 것.
 - Groq: `llama-4-scout` 모델 id가 404이고, 이미지 지원 모델(qwen3.6-27b)은 무료 8000 TPM 제한에 걸린다.
 
 ### 무료 한도
 
-Workers 무료 플랜은 **하루 10,000 뉴런**입니다. 분석 1건당 대략 60~70 뉴런이므로
-**하루 약 150건**까지 무료입니다. 초과하면 요청이 실패하므로, 트래픽이 늘면
-Workers Paid($5/월, 1,000뉴런당 $0.011 ≈ 분석 1건당 1원 수준)로 올리면 됩니다.
+Workers 무료 플랜은 **하루 10,000 뉴런**(UTC 0시 = 한국 오전 9시 초기화)입니다.
+분석 1건은 입력 약 6,000토큰(프롬프트 4,500 + 사진 1,500)이라 **Mistral 기준 약 225뉴런 → 하루 약 45건**,
+Llama 기준 약 170뉴런 → 약 58건입니다. (예전 문서의 "60~70뉴런 / 150건"은 프롬프트가 짧던 시절 값입니다.)
+초과하면 `QUOTA_EXCEEDED` 로 다음 초기화까지 모든 분석이 실패합니다.
+유료 전환 없이 버티려면: 프롬프트 줄이기 → 사진 해상도 낮추기 → 기기별 하루 분석 횟수 제한 순으로 검토합니다.
+시험 호출도 같은 한도를 쓰니 운영 중 실험은 최소화하세요.
 
 **왜 필요한가:** `EXPO_PUBLIC_*` 환경변수는 빌드 시 JS 번들에 평문 문자열로 인라인됩니다.
 APK/AAB를 압축 해제하면 누구나 키를 꺼낼 수 있으므로, 공급자 키는 앱에 둘 수 없습니다.
@@ -63,7 +70,7 @@ curl https://<배포URL>/health
 
 ```bash
 curl https://<배포URL>/health
-# {"ok":true,"providers":["Llama 4 Scout (Workers AI)"]}
+# {"ok":true,"providers":["Mistral Small 3.1 (Workers AI)","Gemini 2.5 Flash","Llama 4 Scout (Workers AI)"],"promptVersion":"..."}
 ```
 
 `providers` 가 빈 배열(`[]`)이면 secret이 아직 등록되지 않은 상태입니다 —
