@@ -485,7 +485,7 @@ export default function App() {
               <Text style={styles.analyzingSubtext}>
                 인형 위치, 크기, 형태를 분석하고 있습니다
               </Text>
-              <Text style={styles.analyzingSubtext}>최대 1분 정도 걸릴 수 있어요</Text>
+              <Text style={styles.analyzingSubtext}>보통 20초 안팎 걸려요</Text>
               <TouchableOpacity style={styles.cancelBtn} onPress={resetToCamera}>
                 <Text style={styles.cancelBtnText}>취소</Text>
               </TouchableOpacity>
