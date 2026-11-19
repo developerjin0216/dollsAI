@@ -28,6 +28,10 @@ interface Provider {
 }
 
 const PER_CALL_TIMEOUT = 25000;
+// Workers AI(Llama 4 Scout)는 실측 32~46초+ 가 걸린다(2026-11-19, NRT, 이전 기록은 평균 6초).
+// 25초·40초로 자르면 대부분 지역 차단된 Gemini로 넘어가 실패했다. Gemini 폴백은 사실상 성공하지 못하므로
+// Llama에 앱이 기다리는 시간(1.4.0+: 60초, 1.3.4 이하: 45초)을 거의 다 준다.
+const BINDING_TIMEOUT = 55000;
 
 // Gemini 2.5 Flash (OpenAI 호환 엔드포인트). 무료 할당량이 있고 비전·한국어·JSON을 지원한다.
 //
@@ -197,7 +201,7 @@ async function callProvider(p: Provider, image: string, colo: string, env: Env):
             const e = new Error('TIMEOUT');
             e.name = 'AbortError';
             reject(e);
-          }, PER_CALL_TIMEOUT);
+          }, BINDING_TIMEOUT);
         }),
       ]);
     } catch (err: any) {
@@ -211,6 +215,8 @@ async function callProvider(p: Provider, image: string, colo: string, env: Env):
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+    // 지연의 대부분은 출력 길이에 비례한다 — 토큰 수를 남겨 프롬프트 길이 조정의 근거로 쓴다.
+    logEvent({ evt: 'ai_usage', provider: p.name, usage: out?.usage ?? null });
     const c = out?.choices?.[0];
     finishReason = c?.finish_reason;
     text = typeof c?.message?.content === 'string' ? c.message.content : (out?.response ?? '');

@@ -43,7 +43,8 @@ export interface AnalysisResult {
 // APP_KEY는 앱 식별용이며 추출될 수 있지만, 서버에서 즉시 교체 가능하고
 // 호출 제한과 함께 동작해 공급자 키와 위험도가 전혀 다르다.
 
-const REQUEST_TIMEOUT = 45000; // 서버가 공급자 2곳을 순차로 시도할 수 있어 넉넉히 잡는다.
+// 서버의 Workers AI 호출 한도(55초)보다 길어야 한다 — Llama 응답이 40초를 넘는 일이 잦다(2026-11 실측).
+const REQUEST_TIMEOUT = 60000;
 
 // 서버 오류 코드 → 사용자에게 보여줄 한국어 문구
 const ERROR_MESSAGES: Record<string, string> = {
