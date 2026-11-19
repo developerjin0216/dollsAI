@@ -75,11 +75,34 @@ curl https://<배포URL>/health
 curl -X POST https://<배포URL>/analyze -H "Content-Type: application/json" -d '{"image":"x"}'
 ```
 
-## 로그
+## 로그 · 운영 지표
 
 ```bash
 npm run tail   # wrangler tail — 공급자 실패 원인이 여기 찍힙니다
 ```
+
+요청마다 구조화 이벤트가 남습니다. 대시보드 → Workers → `dollsai-analyze` → **Logs** 에서
+필드로 필터·집계할 수 있습니다(무료 플랜 보관 3일). 사진·IP는 기록하지 않습니다.
+
+| `evt` | 필드 | 보는 법 |
+|---|---|---|
+| `analyze` | `ok`, `code`(실패 시), `provider`, `ms`, `colo`, `successRate`, `noMachine`, `promptVersion` | 실패율·오류 코드 분포, 평균 응답 시간, `QUOTA_EXCEEDED` 발생 여부, 기계 미검출 비율 |
+| `feedback` | `outcome`(success/fail/skipped), `successRate`, `provider`, `promptVersion` | 성공률 구간별 **실제** 성공 비율 → 프롬프트 상한값 보정 |
+
+`QUOTA_EXCEEDED` 가 보이기 시작하면 무료 한도가 찬 것입니다 — Workers Paid 전환 시점입니다.
+
+## 원격 설정 (`GET /config`) — 앱 출시 없이 바꾸는 값
+
+`wrangler.toml` 의 `[vars]` 를 고치고 `npm run deploy` 하면 즉시 반영됩니다(앱은 실행 시 1회 읽음).
+
+| 변수 | 의미 |
+|---|---|
+| `AD_EVERY` | 분석 N회당 광고 1회. `0` = 광고 끄기(AdMob 장애·정책 이슈 시 긴급 차단) |
+| `NOTICE` | 촬영 화면 상단 공지. 빈 값이면 미표시 |
+| `LATEST_VERSION_CODE` | 이보다 낮은 앱에 "새 버전이 나왔어요" 배너. **Play에 새 버전이 실제 배포된 뒤** 올릴 것 |
+| `MIN_VERSION_CODE` | 이보다 낮은 앱은 사용을 막고 업데이트 화면만 표시. 서버 응답 형식을 깨는 변경 때만 올릴 것 |
+
+1.3.4(versionCode 13) 이하 앱은 `/config` 를 호출하지 않으므로 이 값들의 영향을 받지 않습니다.
 
 ## IP당 호출 제한 (선택, 권장)
 
@@ -95,6 +118,7 @@ npx wrangler kv namespace create RATE_LIMIT
 ## 프롬프트 수정
 
 `src/prompts.ts` 만 고쳐 재배포하면 **앱 업데이트 없이** 분석 품질을 바꿀 수 있습니다.
+고칠 때마다 `PROMPT_VERSION` 을 올리세요 — 로그의 `feedback` 이벤트를 버전별로 비교할 수 있습니다.
 단, JSON 스키마(키 이름·타입)를 바꾸면 앱의 `src/services/gemini.ts` 타입도 함께 맞춰야 합니다.
 
 ## 보안 메모

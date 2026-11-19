@@ -1,4 +1,4 @@
-import { SYSTEM_PROMPT, ANALYSIS_PROMPT } from './prompts';
+import { SYSTEM_PROMPT, ANALYSIS_PROMPT, PROMPT_VERSION } from './prompts';
 
 export interface Env {
   // wrangler secret put ...
@@ -8,6 +8,11 @@ export interface Env {
   MAX_IMAGE_CHARS?: string;
   RATE_LIMIT_MAX?: string;
   RATE_LIMIT_WINDOW_SEC?: string;
+  // 원격 설정(/config) — 앱 릴리스 없이 바꾸는 운영 값
+  AD_EVERY?: string;
+  NOTICE?: string;
+  MIN_VERSION_CODE?: string;
+  LATEST_VERSION_CODE?: string;
   // 선택 바인딩 — 없으면 IP 제한을 건너뛴다.
   RATE_LIMIT?: KVNamespace;
 }
@@ -147,7 +152,14 @@ function normalize(parsed: any) {
   parsed.tips = (Array.isArray(parsed.tips) ? parsed.tips : []).map(asText).filter(Boolean);
   // confidence는 항상 파생 — 모델이 0~1 대신 0~100을 주는 실수가 흔하다.
   parsed.confidence = Math.min(Math.max(parsed.bestTarget.successRate / 100, 0), 1);
+  // 기계 미검출: 프롬프트가 successRate 0을 지시한다. 정상 분석은 최소 10(10 + n×10)이라 0과 겹치지 않는다.
+  // 앱은 이 값을 보고 광고를 건너뛰고 재촬영을 안내한다(구버전 앱은 모르는 필드라 무시).
+  parsed.noMachine = isNoMachine(parsed.bestTarget);
   return parsed;
+}
+
+export function isNoMachine(best: any): boolean {
+  return best?.successRate === 0 || String(best?.name ?? '').includes('찾지 못했');
 }
 
 function buildMessages(image: string) {
@@ -169,12 +181,36 @@ async function callProvider(p: Provider, image: string, colo: string, env: Env):
 
   if (p.kind === 'binding') {
     // Workers AI: Worker 내부 실행이라 fetch도 외부 키도 없다.
-    const out: any = await (env as any).AI.run(p.model, {
-      messages: buildMessages(image),
-      temperature: 0.3,
-      max_tokens: 4000,
-      ...p.extra,
-    });
+    // AbortSignal을 받지 않으므로 타임아웃은 경쟁으로 건다 — 없으면 앱이 자체 한도(45초)까지 멈춘다.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let out: any;
+    try {
+      out = await Promise.race([
+        (env as any).AI.run(p.model, {
+          messages: buildMessages(image),
+          temperature: 0.3,
+          max_tokens: 4000,
+          ...p.extra,
+        }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const e = new Error('TIMEOUT');
+            e.name = 'AbortError';
+            reject(e);
+          }, PER_CALL_TIMEOUT);
+        }),
+      ]);
+    } catch (err: any) {
+      // 무료 일일 한도(10,000 뉴런) 소진: "4006: you have used up your daily free allocation ..."
+      // 상태코드가 없어 그대로 두면 ANALYZE_FAILED로 뭉개진다.
+      if (/4006|daily free allocation/i.test(String(err?.message ?? err))) {
+        console.error(`Workers AI 일일 한도 소진: ${err?.message ?? err}`);
+        throw new Error('QUOTA_EXCEEDED');
+      }
+      throw err;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
     const c = out?.choices?.[0];
     finishReason = c?.finish_reason;
     text = typeof c?.message?.content === 'string' ? c.message.content : (out?.response ?? '');
@@ -240,11 +276,160 @@ async function rateLimited(request: Request, env: Env): Promise<boolean> {
   const max = parseInt(env.RATE_LIMIT_MAX ?? '30', 10);
   const windowSec = parseInt(env.RATE_LIMIT_WINDOW_SEC ?? '3600', 10);
   const key = `rl:${ip}`;
-  const current = parseInt((await env.RATE_LIMIT.get(key)) ?? '0', 10);
-  if (current >= max) return true;
-  // 창 단위 카운터: TTL로 자동 만료시킨다 (정확한 슬라이딩 윈도우는 불필요).
-  await env.RATE_LIMIT.put(key, String(current + 1), { expirationTtl: windowSec });
+  try {
+    const current = parseInt((await env.RATE_LIMIT.get(key)) ?? '0', 10);
+    if (current >= max) return true;
+    // 창 단위 카운터: TTL로 자동 만료시킨다 (정확한 슬라이딩 윈도우는 불필요).
+    await env.RATE_LIMIT.put(key, String(current + 1), { expirationTtl: windowSec });
+  } catch (err) {
+    // 제한은 부가 기능이다 — KV 장애(쓰기 한도 초과 등)로 분석 전체를 막지 않는다.
+    console.warn(`rate limit KV 오류, 제한 없이 진행: ${err}`);
+  }
   return false;
+}
+
+// APP_SECRET은 쉼표로 여러 개를 둘 수 있다. 키를 교체할 때 새 키를 추가해 배포하고,
+// 구버전 앱이 충분히 줄어든 뒤 옛 키를 빼면 구버전 사용자가 한꺼번에 401을 맞지 않는다.
+function appKeyAllowed(request: Request, env: Env): boolean {
+  if (!env.APP_SECRET) return true;
+  const given = request.headers.get('x-app-key');
+  return env.APP_SECRET.split(',').some((k) => k.trim() !== '' && k.trim() === given);
+}
+
+// 운영 지표. 객체를 그대로 console.log 하면 Workers Logs(대시보드 → Workers → Logs)가 필드로 색인해
+// evt / code / provider 별로 필터·집계할 수 있다. 사진·IP 같은 개인 식별 정보는 절대 넣지 않는다.
+function logEvent(fields: Record<string, unknown>): void {
+  console.log(fields);
+}
+
+function intVar(v: string | undefined, fallback: number): number {
+  const n = parseInt(v ?? '', 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// 원격 설정 — 앱은 스토어 심사 없이 고칠 수 없으므로, 운영 중 바꿔야 할 값은 여기서 내려준다.
+// wrangler.toml [vars] 또는 대시보드 변수만 바꿔 배포하면 즉시 반영된다. 앱은 실패 시 기본값을 쓴다.
+function remoteConfig(env: Env) {
+  return {
+    adEvery: intVar(env.AD_EVERY, 3), // 0 이하 = 광고 끄기
+    notice: env.NOTICE?.trim() || null, // 촬영 화면 상단 공지
+    minVersionCode: intVar(env.MIN_VERSION_CODE, 0), // 이보다 낮으면 강제 업데이트
+    latestVersionCode: intVar(env.LATEST_VERSION_CODE, 0), // 이보다 낮으면 업데이트 안내
+  };
+}
+
+const FEEDBACK_OUTCOMES = new Set(['success', 'fail', 'skipped']);
+
+// 뽑기 결과 피드백. 저장소 없이 로그로만 남긴다 — 성공률 구간별 실제 성공 비율을 보정하는 데 쓴다.
+async function handleFeedback(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return json(405, { error: 'METHOD_NOT_ALLOWED' });
+  if (!appKeyAllowed(request, env)) return json(401, { error: 'UNAUTHORIZED' });
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return json(400, { error: 'BAD_JSON' });
+  }
+  if (!FEEDBACK_OUTCOMES.has(body?.outcome)) return json(400, { error: 'BAD_FEEDBACK' });
+  const rate = num(body?.successRate, -1);
+  logEvent({
+    evt: 'feedback',
+    outcome: body.outcome,
+    successRate: rate >= 0 && rate <= 100 ? Math.round(rate) : null,
+    provider: asText(body?.apiSource).slice(0, 60) || null,
+    promptVersion: asText(body?.promptVersion).slice(0, 20) || null,
+  });
+  return json(200, { ok: true });
+}
+
+async function handleAnalyze(request: Request, env: Env, colo: string): Promise<Response> {
+  const t0 = Date.now();
+  const fail = (status: number, code: string): Response => {
+    logEvent({ evt: 'analyze', ok: false, code, ms: Date.now() - t0, colo });
+    return json(status, { error: code });
+  };
+
+  if (request.method !== 'POST') return json(405, { error: 'METHOD_NOT_ALLOWED' });
+
+  // 앱 식별 키. 번들에서 추출될 수 있지만, 공급자 키와 달리 서버에서 즉시 교체할 수 있고
+  // 호출 제한과 함께 무단 사용의 비용을 크게 올린다.
+  if (!appKeyAllowed(request, env)) {
+    return fail(401, 'UNAUTHORIZED');
+  }
+
+  const maxChars = parseInt(env.MAX_IMAGE_CHARS ?? '700000', 10);
+  const declared = Number(request.headers.get('content-length') ?? '0');
+  if (declared && declared > maxChars + 4096) {
+    return fail(413, 'IMAGE_TOO_LARGE');
+  }
+
+  if (await rateLimited(request, env)) {
+    return fail(429, 'RATE_LIMITED');
+  }
+
+  let image: unknown;
+  try {
+    const body: any = await request.json();
+    image = body?.image;
+  } catch {
+    return fail(400, 'BAD_JSON');
+  }
+  if (typeof image !== 'string' || image.length < 1000) {
+    return fail(400, 'BAD_IMAGE');
+  }
+  if (image.length > maxChars) {
+    return fail(413, 'IMAGE_TOO_LARGE');
+  }
+
+  const list = providers(env);
+  if (list.length === 0) {
+    console.error('공급자 키가 설정되지 않았습니다 — wrangler secret put 을 실행하세요.');
+    return fail(500, 'NO_PROVIDER');
+  }
+
+  const statuses: number[] = [];
+  let sawAbort = false;
+  let sawQuota = false;
+  let lastMessage = '';
+
+  for (const p of list) {
+    try {
+      const result = await callProvider(p, image, colo, env);
+      logEvent({
+        evt: 'analyze',
+        ok: true,
+        provider: p.name,
+        ms: Date.now() - t0,
+        colo,
+        successRate: result.bestTarget.successRate,
+        noMachine: result.noMachine,
+        promptVersion: PROMPT_VERSION,
+      });
+      return json(200, { result, apiSource: p.name, promptVersion: PROMPT_VERSION });
+    } catch (err: any) {
+      lastMessage = err?.message ?? '';
+      if (lastMessage.startsWith('API_ERROR:')) {
+        statuses.push(parseInt(lastMessage.split(':')[1], 10));
+      }
+      if (err?.name === 'AbortError') sawAbort = true;
+      if (lastMessage === 'QUOTA_EXCEEDED') sawQuota = true;
+      console.warn(`${p.name} 실패: ${lastMessage || err}`);
+    }
+  }
+
+  // 가장 설명력 있는 실패 원인을 코드로 돌려준다 (앱이 한국어 문구로 변환).
+  // 한도 소진은 재시도로 풀리지 않으므로 가장 먼저 알린다.
+  if (sawQuota) return fail(503, 'QUOTA_EXCEEDED');
+  if (statuses.some((s) => s === 401 || s === 403)) return fail(502, 'PROVIDER_AUTH');
+  if (statuses.some((s) => s === 429)) return fail(429, 'PROVIDER_RATE_LIMIT');
+  if (statuses.some((s) => s >= 500)) return fail(502, 'PROVIDER_UNAVAILABLE');
+  if (lastMessage === 'GEO_BLOCKED') {
+    console.error(`지역 차단: colo=${colo} 에서 Gemini 호출 불가 — smart placement 설정을 확인할 것`);
+    return fail(502, 'GEO_BLOCKED');
+  }
+  if (sawAbort) return fail(504, 'TIMEOUT');
+  if (lastMessage === 'TRUNCATED') return fail(502, 'TRUNCATED');
+  return fail(502, 'ANALYZE_FAILED');
 }
 
 export default {
@@ -253,76 +438,21 @@ export default {
     // 실행 콜로. Gemini 미지원 지역(HKG 등) 진단에 필요하다.
     const colo = ((request as any).cf?.colo as string) ?? 'unknown';
 
-    if (url.pathname === '/health') {
-      return json(200, { ok: true, providers: providers(env).map((p) => p.name) });
+    switch (url.pathname) {
+      case '/health':
+        return json(200, {
+          ok: true,
+          providers: providers(env).map((p) => p.name),
+          promptVersion: PROMPT_VERSION,
+        });
+      case '/config':
+        return json(200, remoteConfig(env));
+      case '/feedback':
+        return handleFeedback(request, env);
+      case '/analyze':
+        return handleAnalyze(request, env, colo);
+      default:
+        return json(404, { error: 'NOT_FOUND' });
     }
-    if (url.pathname !== '/analyze') return json(404, { error: 'NOT_FOUND' });
-    if (request.method !== 'POST') return json(405, { error: 'METHOD_NOT_ALLOWED' });
-
-    // 앱 식별 키. 번들에서 추출될 수 있지만, 공급자 키와 달리 서버에서 즉시 교체할 수 있고
-    // 호출 제한과 함께 무단 사용의 비용을 크게 올린다.
-    if (env.APP_SECRET && request.headers.get('x-app-key') !== env.APP_SECRET) {
-      return json(401, { error: 'UNAUTHORIZED' });
-    }
-
-    const maxChars = parseInt(env.MAX_IMAGE_CHARS ?? '700000', 10);
-    const declared = Number(request.headers.get('content-length') ?? '0');
-    if (declared && declared > maxChars + 4096) {
-      return json(413, { error: 'IMAGE_TOO_LARGE' });
-    }
-
-    if (await rateLimited(request, env)) {
-      return json(429, { error: 'RATE_LIMITED' });
-    }
-
-    let image: unknown;
-    try {
-      const body: any = await request.json();
-      image = body?.image;
-    } catch {
-      return json(400, { error: 'BAD_JSON' });
-    }
-    if (typeof image !== 'string' || image.length < 1000) {
-      return json(400, { error: 'BAD_IMAGE' });
-    }
-    if (image.length > maxChars) {
-      return json(413, { error: 'IMAGE_TOO_LARGE' });
-    }
-
-    const list = providers(env);
-    if (list.length === 0) {
-      console.error('공급자 키가 설정되지 않았습니다 — wrangler secret put 을 실행하세요.');
-      return json(500, { error: 'NO_PROVIDER' });
-    }
-
-    const statuses: number[] = [];
-    let sawAbort = false;
-    let lastMessage = '';
-
-    for (const p of list) {
-      try {
-        const result = await callProvider(p, image, colo, env);
-        return json(200, { result, apiSource: p.name });
-      } catch (err: any) {
-        lastMessage = err?.message ?? '';
-        if (lastMessage.startsWith('API_ERROR:')) {
-          statuses.push(parseInt(lastMessage.split(':')[1], 10));
-        }
-        if (err?.name === 'AbortError') sawAbort = true;
-        console.warn(`${p.name} 실패: ${lastMessage || err}`);
-      }
-    }
-
-    // 가장 설명력 있는 실패 원인을 코드로 돌려준다 (앱이 한국어 문구로 변환).
-    if (statuses.some((s) => s === 401 || s === 403)) return json(502, { error: 'PROVIDER_AUTH' });
-    if (statuses.some((s) => s === 429)) return json(429, { error: 'PROVIDER_RATE_LIMIT' });
-    if (statuses.some((s) => s >= 500)) return json(502, { error: 'PROVIDER_UNAVAILABLE' });
-    if (lastMessage === 'GEO_BLOCKED') {
-      console.error(`지역 차단: colo=${colo} 에서 Gemini 호출 불가 — smart placement 설정을 확인할 것`);
-      return json(502, { error: 'GEO_BLOCKED' });
-    }
-    if (sawAbort) return json(504, { error: 'TIMEOUT' });
-    if (lastMessage === 'TRUNCATED') return json(502, { error: 'TRUNCATED' });
-    return json(502, { error: 'ANALYZE_FAILED' });
   },
 };
